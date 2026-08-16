@@ -23,6 +23,9 @@ jobs:
       # 下面的同步脚本，上游地址和分支我都帮你填好为 BootstrapBlazor/BootstrapBlazor.Extensions 的 main 分支了
       - name: Config git and run sync
         run: |
+          # 设置 Git 身份（必须）
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/BootstrapBlazor/BootstrapBlazor.Extensions.git
           git fetch upstream
           git checkout master
