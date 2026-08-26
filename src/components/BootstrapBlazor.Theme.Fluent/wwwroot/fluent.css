@@ -1016,6 +1016,17 @@
     --bs-btn-padding-y: 8px;
 }
 
+/* BootstrapBlazor extra-small button (TableCellButton) — the .btn rule above has
+ * equal specificity and loads later, so it would otherwise override .btn-xs sizing;
+ * restore the library defaults ($bs-btn-xs-*, Bootstrap line-height 1.5) */
+.btn-xs,
+.btn-group-xs > .btn {
+    --bs-btn-padding-x: .3125rem; /* $bs-btn-xs-padding-x */
+    --bs-btn-padding-y: .0625rem; /* $bs-btn-xs-padding-y */
+    --bs-btn-font-size: .75rem; /* $bs-btn-xs-font-size */
+    --bs-btn-line-height: 1.5; /* Bootstrap default, library .btn-xs does not override it */
+}
+
 /* Button groups — bundle targets .btn-group-sm/lg > .btn directly at higher specificity */
 .btn-group-sm > .btn {
     --bs-btn-font-size: .75rem; /* fontSizeBase200 */
@@ -1443,6 +1454,14 @@ fieldset:disabled .btn {
 /* BB adds .5rem between input and label — already accounted for in the 12px Fluent gap */
 .form-check:not(:where(.form-switch, .form-check-sm, .form-check-md, .form-check-lg, .form-check-xl, .form-check-xxl, .form-check-reverse, .is-label)) .form-check-input + .form-check-label {
     margin-inline-start: 0;
+}
+
+/* Input-group checkbox (BootstrapInputGroup) — the library lays these out as a centered
+ * flex cell (.input-group > .form-check) with its own padding, so the standalone
+ * negative-margin indicator offset above would drag the box over the cell border;
+ * restore the library margins here (higher specificity, loads later) */
+.input-group > .form-check .form-check-input {
+    margin: 3px 0 1px 0; /* same as library Checkbox.razor.scss */
 }
 
 .form-check .form-check-input {
