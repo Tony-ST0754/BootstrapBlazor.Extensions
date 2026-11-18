@@ -28,6 +28,8 @@ public partial class ComponentAnalyzer
     private readonly string? _samplesPath;
     private readonly string? _extensionsSourcePath;
     private readonly IReadOnlyDictionary<string, string>? _extensionProjects;
+    private readonly bool _singleProject;
+    private readonly string? _extensionRepository;
 
     private CSharpCompilation? _compilation;
     private readonly Dictionary<string, SyntaxTree> _treeByPath = new(StringComparer.OrdinalIgnoreCase);
@@ -52,10 +54,13 @@ public partial class ComponentAnalyzer
     }
 
     internal ComponentAnalyzer(string sourcePath, string? extensionsSourcePath,
-        IReadOnlyDictionary<string, string>? extensionProjects, bool includeSamples)
+        IReadOnlyDictionary<string, string>? extensionProjects, bool includeSamples, bool singleProject = false)
     {
         _sourcePath = sourcePath;
-        _componentsPath = Path.Combine(sourcePath, "Components");
+        _singleProject = singleProject;
+        _componentsPath = singleProject ? sourcePath : Path.Combine(sourcePath, "Components");
+        _extensionRepository = singleProject
+            ? FindExtensionRepository(sourcePath) : null;
         _samplesPath = includeSamples
             ? Path.Combine(Path.GetDirectoryName(sourcePath)!, "BootstrapBlazor.Server", "Components", "Samples")
             : null;
@@ -86,6 +91,7 @@ public partial class ComponentAnalyzer
             .Concat(Directory.GetFiles(_componentsPath, "*Base.cs", SearchOption.AllDirectories))
             .Concat(Directory.GetFiles(_componentsPath, "*.razor", SearchOption.AllDirectories)
                 .Where(file => !File.Exists(file + ".cs") && _treeByPath.ContainsKey(Path.GetFullPath(file))))
+            .Where(IsCompilableSource)
             .Distinct(StringComparer.OrdinalIgnoreCase);
 
         var seenTypes = new HashSet<string>(StringComparer.Ordinal);
@@ -93,7 +99,7 @@ public partial class ComponentAnalyzer
         foreach (var file in entryFiles)
         {
             var component = AnalyzeEntryFile(file);
-            if (component != null && component.Parameters.Count > 0 && seenTypes.Add(component.FullName))
+            if (component != null && (_singleProject || component.Parameters.Count > 0) && seenTypes.Add(component.FullName))
             {
                 components.Add(component);
             }
@@ -119,7 +125,7 @@ public partial class ComponentAnalyzer
             }
 
             var component = BuildComponentInfo(symbol, declaration, declaration.SyntaxTree.FilePath);
-            if (component.Parameters.Count > 0 && seenTypes.Add(component.FullName))
+            if ((_singleProject || component.Parameters.Count > 0) && seenTypes.Add(component.FullName))
             {
                 components.Add(component);
             }
@@ -226,7 +232,7 @@ public partial class ComponentAnalyzer
         return services;
     }
 
-    internal async Task<List<ComponentInfo>> AnalyzeCoreServicesAsync(IEnumerable<ComponentInfo> components)
+    internal async Task<List<ComponentInfo>> AnalyzeProjectServicesAsync(IEnumerable<ComponentInfo> components)
     {
         await EnsureCompilationAsync();
 
@@ -240,7 +246,7 @@ public partial class ComponentAnalyzer
             var path = Path.GetFullPath(tree.FilePath);
             var inServices = path.StartsWith(servicePath, StringComparison.OrdinalIgnoreCase);
             var inComponents = path.StartsWith(componentPath, StringComparison.OrdinalIgnoreCase);
-            if (!inServices && !inComponents)
+            if (!_singleProject && !inServices && !inComponents)
             {
                 continue;
             }
@@ -249,7 +255,7 @@ public partial class ComponentAnalyzer
             foreach (var declaration in tree.GetRoot().DescendantNodes().OfType<TypeDeclarationSyntax>())
             {
                 if (model.GetDeclaredSymbol(declaration) is not INamedTypeSymbol symbol ||
-                    symbol.DeclaredAccessibility != Accessibility.Public || symbol.ContainingType != null || symbol.IsStatic ||
+                    symbol.DeclaredAccessibility != Accessibility.Public || symbol.ContainingType != null ||
                     symbol.DeclaringSyntaxReferences.Select(reference => reference.GetSyntax())
                         .OfType<TypeDeclarationSyntax>().SelectMany(type => type.AttributeLists)
                         .SelectMany(list => list.Attributes).Any(attribute =>
@@ -258,10 +264,14 @@ public partial class ComponentAnalyzer
                     continue;
                 }
 
-                var isService = symbol.TypeKind == TypeKind.Interface &&
+                var isService = !symbol.IsStatic && (symbol.TypeKind == TypeKind.Interface &&
                     (inServices || symbol.Name.EndsWith("Service", StringComparison.Ordinal) || symbol.Name.EndsWith("Provider", StringComparison.Ordinal))
-                    || symbol.TypeKind == TypeKind.Class && symbol.Name.EndsWith("Service", StringComparison.Ordinal);
-                if (!isService)
+                    || symbol.TypeKind == TypeKind.Class &&
+                    (symbol.Name.EndsWith("Service", StringComparison.Ordinal) ||
+                     _singleProject && symbol.Name.EndsWith("Provider", StringComparison.Ordinal)));
+                var isRegistrationExtension = _singleProject && symbol.IsStatic &&
+                    symbol.GetMembers().OfType<IMethodSymbol>().Any(IsServiceRegistrationMethod);
+                if (!isService && !isRegistrationExtension)
                 {
                     continue;
                 }
@@ -273,7 +283,7 @@ public partial class ComponentAnalyzer
 
                 if (symbols.TryGetValue(symbol.Name, out var existing) && !SymbolEqualityComparer.Default.Equals(existing, symbol))
                 {
-                    throw new InvalidDataException($"Core service names collide: {existing.ToDisplayString()} and {symbol.ToDisplayString()}");
+                    throw new InvalidDataException($"Service names collide: {existing.ToDisplayString()} and {symbol.ToDisplayString()}");
                 }
 
                 symbols[symbol.Name] = symbol;
@@ -281,10 +291,23 @@ public partial class ComponentAnalyzer
         }
 
         return symbols.Values.OrderBy(symbol => symbol.Name, StringComparer.Ordinal)
-            .Select(symbol => BuildServiceInfo(symbol, includeTypeParameters: true)).ToList();
+            .Select(symbol =>
+            {
+                var info = BuildServiceInfo(symbol, includeTypeParameters: true, serviceRegistrationsOnly: symbol.IsStatic);
+                if (_singleProject)
+                {
+                    info.IsExtension = _extensionRepository != null;
+                    info.SuppressSourceLink = _extensionRepository == null;
+                    if (!symbol.IsStatic)
+                    {
+                        info.Registrations = ResolveRegistrations(symbol, null);
+                    }
+                }
+                return info;
+            }).ToList();
     }
 
-    private ComponentInfo BuildServiceInfo(INamedTypeSymbol symbol, bool includeTypeParameters = false)
+    private ComponentInfo BuildServiceInfo(INamedTypeSymbol symbol, bool includeTypeParameters = false, bool serviceRegistrationsOnly = false)
     {
         var syntax = symbol.DeclaringSyntaxReferences.First().GetSyntax();
         return new ComponentInfo
@@ -294,7 +317,8 @@ public partial class ComponentAnalyzer
             Summary = ExtractXmlSummary(syntax),
             TypeParameters = includeTypeParameters ? symbol.TypeParameters.Select(type => type.Name).ToList() : new(),
             SourcePath = GetRelativePath(syntax.SyntaxTree.FilePath),
-            PublicMethods = CollectMethods(symbol)
+            PublicMethods = CollectMethods(symbol, serviceRegistrationsOnly),
+            IsServiceRegistrationExtension = serviceRegistrationsOnly
         };
     }
 
@@ -574,6 +598,11 @@ public partial class ComponentAnalyzer
     private async Task<string?> BuildInheritsShimAsync(string razorFile)
     {
         var content = await File.ReadAllTextAsync(razorFile);
+        if (_singleProject && (Path.GetFileName(razorFile).StartsWith('_') ||
+            content.Split('\n').Any(line => line.TrimStart().StartsWith("@page ", StringComparison.Ordinal))))
+        {
+            return null;
+        }
 
         string? baseType = null;
         string? ns = null;
@@ -601,10 +630,11 @@ public partial class ComponentAnalyzer
             }
         }
 
-        if (string.IsNullOrEmpty(baseType))
+        if (string.IsNullOrEmpty(baseType) && !_singleProject)
         {
             return null;
         }
+        baseType ??= "ComponentBase";
 
         var className = Path.GetFileNameWithoutExtension(razorFile);
         ns ??= GetNamespaceForRazor(razorFile) ?? "BootstrapBlazor.Components";
@@ -695,6 +725,8 @@ public partial class ComponentAnalyzer
             TypeParameters = symbol.TypeParameters.Select(t => t.Name).ToList(),
             BaseClass = GetBaseClassName(symbol),
             SourcePath = GetRelativePath(filePath),
+            IsExtension = _singleProject && _extensionRepository != null,
+            SuppressSourceLink = _singleProject && _extensionRepository == null,
             LastModified = File.GetLastWriteTimeUtc(filePath),
             SamplePath = FindSamplePath(symbol.Name),
             Parameters = CollectParameters(symbol),
@@ -763,11 +795,22 @@ public partial class ComponentAnalyzer
         return parameters.OrderBy(p => p.Name).ToList();
     }
 
+    private static bool IsServiceRegistrationMethod(IMethodSymbol method)
+    {
+        return method.DeclaredAccessibility == Accessibility.Public && method.IsExtensionMethod &&
+            (method.Name.StartsWith("Add", StringComparison.Ordinal) || method.Name.StartsWith("TryAdd", StringComparison.Ordinal)) &&
+            method.Parameters[0].Type.Name == "IServiceCollection" &&
+            !method.DeclaringSyntaxReferences.Select(reference => reference.GetSyntax())
+                .OfType<MethodDeclarationSyntax>().SelectMany(declaration => declaration.AttributeLists)
+                .SelectMany(list => list.Attributes).Any(attribute =>
+                    attribute.Name.ToString().Split('.').Last() is "Obsolete" or "ObsoleteAttribute");
+    }
+
     /// <summary>
     /// Collect public methods declared on the component itself (partials merged),
     /// excluding overrides, constructors, accessors and operators.
     /// </summary>
-    private List<MethodInfo> CollectMethods(INamedTypeSymbol type)
+    private List<MethodInfo> CollectMethods(INamedTypeSymbol type, bool serviceRegistrationsOnly = false)
     {
         var methods = new List<MethodInfo>();
 
@@ -776,7 +819,8 @@ public partial class ComponentAnalyzer
             if (method.DeclaredAccessibility != Accessibility.Public ||
                 method.IsOverride ||
                 method.IsImplicitlyDeclared ||
-                method.MethodKind != MethodKind.Ordinary)
+                method.MethodKind != MethodKind.Ordinary ||
+                serviceRegistrationsOnly && !IsServiceRegistrationMethod(method))
             {
                 continue;
             }
@@ -788,6 +832,10 @@ public partial class ComponentAnalyzer
 
             methods.Add(new MethodInfo
             {
+                Signature = serviceRegistrationsOnly && syntax != null
+                    ? syntax.WithAttributeLists(default).WithBody(null).WithExpressionBody(null)
+                        .WithSemicolonToken(default).WithoutTrivia().NormalizeWhitespace(indentation: "", eol: " ").ToFullString()
+                    : null,
                 Name = method.Name,
                 ReturnType = method.ReturnType.ToDisplayString(TypeFormat),
                 Description = ResolveDescription(method),
@@ -1042,6 +1090,10 @@ public partial class ComponentAnalyzer
     private string GetRelativePath(string fullPath)
     {
         var full = Path.GetFullPath(fullPath);
+        if (_singleProject)
+        {
+            return Path.GetRelativePath(_extensionRepository ?? _sourcePath, full).Replace('\\', '/');
+        }
 
         // Extension sources live in a separate repository; make the path relative to
         // that repo root (the parent of its src folder).
@@ -1053,6 +1105,7 @@ public partial class ComponentAnalyzer
                 var extRoot = Path.GetDirectoryName(extSrc)!;
                 return Path.GetRelativePath(extRoot, full).Replace('\\', '/');
             }
+
         }
 
         var sourceRoot = Path.GetFullPath(_sourcePath);
@@ -1063,6 +1116,18 @@ public partial class ComponentAnalyzer
 
         var basePath = Path.GetDirectoryName(Path.GetDirectoryName(sourceRoot))!;
         return Path.GetRelativePath(basePath, full).Replace('\\', '/');
+    }
+
+    private static string? FindExtensionRepository(string sourcePath)
+    {
+        for (var directory = new DirectoryInfo(Path.GetFullPath(sourcePath)); directory != null; directory = directory.Parent)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "BootstrapBlazor.Extensions.slnx")))
+            {
+                return directory.FullName;
+            }
+        }
+        return null;
     }
 
     private string? FindSamplePath(string componentName)
